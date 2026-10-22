@@ -624,6 +624,31 @@ def _extract_user_id(attrs: dict[str, Any]) -> str | None:
     )
 
 
+# OTLP Span.flags bits (opentelemetry-proto trace.proto, SpanFlags): whether the
+# parent's is_remote is known, and if so whether the parent is remote.
+_SPAN_FLAGS_CONTEXT_HAS_IS_REMOTE = 0x100
+_SPAN_FLAGS_CONTEXT_IS_REMOTE = 0x200
+
+
+def _has_remote_parent(otel_span: dict, attrs: dict[str, Any]) -> bool:
+    """Whether a span with a parent is still the root of what its service sent.
+
+    A service called by another traced service gets the caller's span as a remote
+    parent, so none of its spans has an empty parent. OTLP flags say so when the
+    sender sets them (the Python SDK does: 0x300 for a remote parent). OTel JS sends
+    no flags; there the TraceRoot SDK's own ancestry is the signal, since it writes
+    an empty ids_path for a span whose parent it could not resolve, i.e. its root.
+    """
+    try:
+        flags = int(otel_span.get("flags") or 0)
+    except (TypeError, ValueError):
+        flags = 0
+    if flags & _SPAN_FLAGS_CONTEXT_HAS_IS_REMOTE:
+        return bool(flags & _SPAN_FLAGS_CONTEXT_IS_REMOTE)
+    ids_path = attrs.get(SPAN_IDS_PATH)
+    return isinstance(ids_path, (list, tuple)) and not ids_path
+
+
 def _extract_session_id(attrs: dict[str, Any]) -> str | None:
     """Extract session_id from span attributes, checking multiple keys."""
     return str_or_none(attrs.get("traceroot.trace.session_id") or attrs.get("session.id"))
@@ -689,7 +714,7 @@ def transform_otel_to_clickhouse(
     # Best-known root name per trace: (ids_path_length, name).
     # Shortest ids_path = closest to root. Used to correct eager trace names
     # when the first span in a batch isn't the closest-to-root span for that trace.
-    _trace_name_candidates: dict[str, tuple[int, str]] = {}
+    _trace_name_candidates: dict[str, tuple[float, str]] = {}
     trace_git_attrs: dict[str, dict[str, str | None]] = {}
 
     # Trace-level fields collected from ANY span in the batch and applied post-loop.
@@ -1212,6 +1237,22 @@ def transform_otel_to_clickhouse(
 
                 spans.append(span_record)
 
+                # A remote-parent entry span roots this service's part of a distributed
+                # trace. It stands in for the root unless the caller's own root is here,
+                # and among several remote roots the earliest one wins.
+                remote_parent_root = bool(parent_span_id) and _has_remote_parent(
+                    otel_span, span_attrs
+                )
+                current_root = traces.get(trace_id, {})
+                take_remote = (
+                    remote_parent_root
+                    and current_root.get("root_kind") != "root"
+                    and (
+                        current_root.get("root_kind") != "remote_parent"
+                        or start_time < current_root["trace_start_time"]
+                    )
+                )
+
                 # Collect user_id/session_id from ANY span (not just root)
                 # Priority: root span values overwrite, child span values only set if empty
                 span_user_id = _extract_user_id(span_attrs)
@@ -1225,7 +1266,7 @@ def transform_otel_to_clickhouse(
                 if trace_id not in trace_git_attrs:
                     trace_git_attrs[trace_id] = {"git_ref": None, "git_repo": None}
 
-                if not parent_span_id:
+                if not parent_span_id or take_remote:
                     # Root span: always use its values if present (overwrites child values)
                     trace_attrs[trace_id]["user_id"] = (
                         span_user_id or trace_attrs[trace_id]["user_id"]
@@ -1286,6 +1327,12 @@ def transform_otel_to_clickhouse(
                 if not parent_span_id:
                     # Actual root span — definitive, depth 0.
                     _trace_name_candidates[trace_id] = (0, span_name)
+                elif remote_parent_root:
+                    # Only the remote root that won names the trace: below a true root,
+                    # above any span with a local parent. Its empty ids_path must not
+                    # reach the depth rule below, where it would count as depth 0.
+                    if take_remote:
+                        _trace_name_candidates[trace_id] = (0.5, span_name)
                 else:
                     span_path_c = span_attrs.get(SPAN_PATH)
                     ids_path_c = span_attrs.get(SPAN_IDS_PATH)
@@ -1299,8 +1346,13 @@ def transform_otel_to_clickhouse(
                     if existing is None or depth < existing[0]:
                         _trace_name_candidates[trace_id] = (depth, candidate_name)
 
-                if not parent_span_id:
-                    # Root span arrived — upgrade to full trace with rich metadata
+                if not parent_span_id or take_remote:
+                    # Root span arrived — upgrade to full trace with rich metadata.
+                    # A root that replaces an earlier one drops that one's I/O first.
+                    if traces[trace_id].get("root_kind"):
+                        for key in ("input", "output", "metadata"):
+                            traces[trace_id].pop(key, None)
+                    traces[trace_id]["root_kind"] = "remote_parent" if parent_span_id else "root"
                     traces[trace_id].update(
                         {
                             "trace_start_time": start_time,

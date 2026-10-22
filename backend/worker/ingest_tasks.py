@@ -349,10 +349,62 @@ def process_s3_traces(self, s3_key: str, project_id: str) -> dict:
         logger.info(f"Transformed {len(traces)} traces and {len(spans)} spans from {s3_key}")
 
         root_bearing_trace_ids = {s["trace_id"] for s in spans if s.get("parent_span_id") is None}
+        # Detector runs are claimed by a trace's true root only (see below).
+        true_root_trace_ids = set(root_bearing_trace_ids)
 
         # 3. Insert into ClickHouse
         if traces or spans:
             ch_client = get_clickhouse_client()
+
+            # A service called by another traced service has a remote parent on its
+            # entry span, so no span here has an empty parent; the transform marks
+            # that entry as this batch's root. It writes the trace row unless the
+            # caller's own root is already stored, or the stored row starts earlier
+            # (an earlier call's entry already holds it). It never takes the detector
+            # claim: that decision is made once, from the summary at hand, and the
+            # caller's root may still be on its way (#2641).
+            remote_root_starts = {
+                t["trace_id"]: t["trace_start_time"]
+                for t in traces
+                if t.get("root_kind") == "remote_parent"
+                and t["trace_id"] not in root_bearing_trace_ids
+            }
+            if remote_root_starts:
+                ids = list(remote_root_starts)
+                params = {"ids": ids, "project_id": project_id}
+                stored_true_roots = {
+                    row[0]
+                    for row in ch_client.query(
+                        "SELECT DISTINCT trace_id FROM spans"
+                        " WHERE project_id = {project_id:String}"
+                        " AND trace_id IN {ids:Array(String)}"
+                        " AND parent_span_id IS NULL",
+                        parameters=params,
+                    ).result_rows
+                }
+                # Compared as epoch milliseconds: the insert stores a naive datetime
+                # through .timestamp(), so this is the same instant whatever the
+                # worker's local timezone.
+                stored_start_ms = {
+                    row[0]: row[1]
+                    for row in ch_client.query(
+                        "SELECT trace_id, toUnixTimestamp64Milli(trace_start_time) FROM traces"
+                        " WHERE project_id = {project_id:String}"
+                        " AND trace_id IN {ids:Array(String)}"
+                        " ORDER BY ch_update_time DESC"
+                        " LIMIT 1 BY trace_id",
+                        parameters=params,
+                    ).result_rows
+                }
+                root_bearing_trace_ids |= {
+                    trace_id
+                    for trace_id, start in remote_root_starts.items()
+                    if trace_id not in stored_true_roots
+                    and not (
+                        trace_id in stored_start_ms
+                        and stored_start_ms[trace_id] < int(start.timestamp() * 1000)
+                    )
+                }
 
             if traces:
                 # Only insert a trace record if this batch contains the root span
@@ -453,11 +505,11 @@ def process_s3_traces(self, s3_key: str, project_id: str) -> dict:
         # duplicate root delivery. Batches without the root span are ignored
         # here; the worker waits out the quiescence window before evaluating,
         # so late spans need no enqueue.
-        if root_bearing_trace_ids:
+        if true_root_trace_ids:
             try:
                 from worker.detector_tasks import enqueue_detector_runs
 
-                enqueue_detector_runs(project_id, root_bearing_trace_ids)
+                enqueue_detector_runs(project_id, true_root_trace_ids)
             except Exception as e:
                 logger.error(f"Failed to call detector tasks: {e}", exc_info=True)
 
